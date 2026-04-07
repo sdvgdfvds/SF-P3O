@@ -120,8 +120,9 @@ def find_runs(base_dirs, env, algo, steps_filter=None, probe=False):
         results.extend(glob.glob(pat))
     return sorted(results)
 
-def load_seeds(base_dirs, env, algo, steps_filter=None, probe=False):
-    """Load running-mean reward for all seeds. Returns list of (steps, vals)."""
+def load_seeds(base_dirs, env, algo, steps_filter=None, probe=False, min_steps=None):
+    """Load running-mean reward for all seeds. Returns list of (steps, vals).
+    If min_steps is set, skip seeds whose last step < min_steps."""
     runs = find_runs(base_dirs, env, algo, steps_filter, probe)
     data = []
     for run in runs:
@@ -129,6 +130,9 @@ def load_seeds(base_dirs, env, algo, steps_filter=None, probe=False):
         if os.path.exists(csv):
             s, v = parse_reward(csv)
             if len(s) > 1:
+                if min_steps and s[-1] < min_steps:
+                    print(f'    [SKIP] {os.path.basename(run)}: only {s[-1]} steps')
+                    continue
                 data.append((s, v))
     return data
 
@@ -202,12 +206,14 @@ def fmt_steps(x, _):
 def plot_env(algos, colors, env, base_dirs, steps_filter,
              title_suffix='', xlabel='Training Steps',
              ylabel='Average Return', figsize=(8, 6),
-             n_pts=500, probe=False, reversal_step=None):
+             n_pts=500, probe=False, reversal_step=None, min_steps=None):
     """Create one figure for one environment."""
     fig, ax = plt.subplots(figsize=figsize)
 
-    for algo in algos:
-        sd = load_seeds(base_dirs, env, algo, steps_filter, probe)
+    # Draw other algos first, SF-P3O last so it's on top
+    ordered = [a for a in algos if a != 'SF-P3O'] + [a for a in algos if a == 'SF-P3O']
+    for algo in ordered:
+        sd = load_seeds(base_dirs, env, algo, steps_filter, probe, min_steps)
         if not sd:
             print(f'    [SKIP] {algo} on {env}: no data')
             continue
@@ -216,7 +222,7 @@ def plot_env(algos, colors, env, base_dirs, steps_filter,
             print(f'    [SKIP] {algo} on {env}: aggregate failed')
             continue
         lw = 2.8 if algo == 'SF-P3O' else 1.6
-        zo = 10 if algo == 'SF-P3O' else 5
+        zo = 20 if algo == 'SF-P3O' else 5
         label = ALGO_DISPLAY.get(algo, algo)
         ax.plot(x, m, label=label, color=colors.get(algo, '#333'),
                 linewidth=lw, zorder=zo)
@@ -272,7 +278,7 @@ for env in ['HalfCheetah-v4', 'Hopper-v4', 'Walker2d-v4']:
                 rev_step = json.load(f).get('hp', {}).get('reversal_step')
     fig = plot_env(MAIN_ALGOS, COLORS, env, [PROBE], None,
                    title_suffix=' (Reward Reversal)', probe=True,
-                   reversal_step=rev_step)
+                   reversal_step=rev_step, min_steps=1400000)
     name = ENV_DISPLAY[env]
     path = os.path.join(OUT, f'fig2_reversal_{name}.png')
     fig.savefig(path)
