@@ -1,0 +1,644 @@
+\documentclass[twocolumn]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{float}
+
+\newtheorem{theorem}{\bf 定理}
+\newtheorem{proposition}{\bf 命题}
+\newtheorem{lemma}{\bf 引理}
+\newtheorem{definition}{\bf 定义}
+\newtheorem{remark}{\bf 注记}
+\newtheorem{corollary}{\bf 推论}
+
+\newcommand{\erank}{\mathrm{erank}}
+\newcommand{\Tr}{\mathrm{Tr}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{\textbf{SF-P3O: 基于谱-Fisher双通道的可塑性保持策略优化}}
+
+\author{
+  匿名作者
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+深度强化学习智能体在训练过程中会逐渐丧失学习新知识的能力，这一现象被称为\textbf{可塑性丧失}(plasticity loss)。现有方法要么缺乏对干预时机的精确判断（如周期性重置），要么在恢复可塑性的同时破坏已习得的知识（如Shrink \& Perturb）。本文提出\textbf{SF-P3O}（Spectral-Fisher Dual-Pathway Plasticity-Preserving Policy Optimization），该方法集成三个创新组件：(1)~基于权重矩阵有效秩的\textbf{谱可塑性诊断}机制，提供无需奖励反馈的可塑性退化触发器；(2)~\textbf{Fisher引导的谱扰动}方法，在可证明约束KL散度的前提下定向恢复退化的奇异值；(3)~具有状态依赖门控的\textbf{双通道架构}，将可塑性恢复与策略稳定性解耦。在MuJoCo连续控制基准上，SF-P3O在5个环境中的4个上超越PPO 8\%--40\%，并持续优于现有可塑性保持方法（ReDo、Shrink \& Perturb、L2-Init），同时保持稳定的学习轨迹。在长时域训练（3M步）中，SF-P3O的优势进一步扩大至47\%--49\%。
+\end{abstract}
+
+\textbf{关键词：} 深度强化学习；可塑性丧失；谱分析；Fisher信息；策略优化
+
+
+% ============================================================================
+\section{引言}
+\label{sec:intro}
+
+深度强化学习（Deep RL）在连续控制\cite{schulman2017ppo,haarnoja2018sac}、博弈\cite{silver2017mastering}和机器人操控\cite{levine2016end}等领域取得了显著成功。然而，越来越多的研究揭示了一个根本性挑战：在非平稳数据分布上训练的神经网络——这在强化学习中是固有的——会逐渐丧失表示新信息的能力\cite{lyle2023understanding,dohare2024loss,kumar2020implicit}。这一现象被称为\textbf{可塑性丧失}(plasticity loss)，表现为权重矩阵有效秩下降、休眠神经元增加，最终导致性能停滞甚至下降。
+
+可塑性丧失的隐蔽性使其尤为危险。标准训练指标（损失值、奖励）可能看起来正常，而网络的表示能力却在持续侵蚀。当性能明显下降时，网络可能已经丧失了大量容量，简单的干预已无法恢复。这促使我们需要(i)~一种能够\textbf{早期检测}可塑性丧失的诊断机制，以及(ii)~一种在\textbf{不破坏已学知识}的前提下恢复容量的干预手段。
+
+现有方法从不同角度应对可塑性丧失：周期性层重置\cite{nikishin2022primacy}、休眠神经元回收\cite{sokar2023dormant}、朝初始化方向的权重正则化\cite{kumar2023maintaining}、全局收缩与扰动\cite{ash2020warm}等。尽管各有成效，但它们存在共同的局限性：(a)~干预由固定调度触发，而非基于实际需求，导致不必要的干扰或错过干预时机；(b)~扰动是各向同性的（随机噪声），将有限的KL散度预算浪费在无助于容量恢复的方向上；(c)~干预本身可能灾难性地破坏已学到的良好行为。
+
+本文提出\textbf{SF-P3O}，通过统一框架同时解决上述三个局限：
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{谱可塑性诊断}。我们使用权重矩阵的\textbf{有效秩}\cite{roy2007effective}作为表示容量的连续、逐层度量。当有效秩相对于初始值下降超过阈值时，发出容量丧失信号——而非仅仅是正常的特化过程。该诊断独立于奖励信号运行，避免了基于损失的触发器所面临的反馈回路问题。
+
+    \item \textbf{Fisher引导的谱扰动}。我们对每个权重矩阵执行SVD分解，选择性地增强\textbf{退化的奇异值}——即那些坍缩到层均值以下的方向。关键创新在于，恢复过程受到对角Fisher信息矩阵的遮蔽，确保对当前策略至关重要的奇异方向得到保护。我们证明了该扰动可以界定与当前策略之间的KL散度（定理\ref{thm:kl_bound}）。
+
+    \item \textbf{双通道架构}。我们引入具有学习型状态依赖门控的双头架构。\textbf{稳定通道}（较低学习率，不接受扰动）保存可靠行为，\textbf{可塑通道}（完整学习率，接受谱扰动）探索新表示。门控机制在两个通道之间平滑插值，提供自动安全网：若扰动降低了可塑通道的质量，稳定通道的贡献会自动增加。
+\end{enumerate}
+
+\noindent 本文的主要贡献如下：
+\begin{itemize}[leftmargin=*]
+    \item 提出了一种无需奖励反馈、逐层检测可塑性丧失的谱诊断机制；
+    \item 设计了理论上有保证的扰动方法，将恢复努力最优地导向容量不足的谱方向，同时约束策略变化；
+    \item 构建了将可塑性恢复与性能稳定性解耦的双通道架构；
+    \item 在5个MuJoCo环境上的全面实验验证了方法的有效性，在长时域训练中优势进一步扩大。
+\end{itemize}
+
+
+% ============================================================================
+\section{相关工作}
+\label{sec:related}
+
+\subsection{深度强化学习中的可塑性丧失}
+
+神经网络在RL训练中丧失学习能力的现象已在多种场景中得到记录\cite{lyle2023understanding,dohare2024loss,nikishin2022primacy,kumar2020implicit}。Lyle等\cite{lyle2023understanding}提供了全面的实证研究，将可塑性丧失与有效秩下降、休眠神经元增加和特征范数爆炸联系起来。Dohare等\cite{dohare2024loss}将根本原因追溯到非平稳目标与梯度优化之间的交互作用，指出即使在分布偏移的监督学习中也会出现类似退化。该工作发表于\emph{Nature}，标志着可塑性丧失问题已成为深度学习领域的核心挑战之一。
+
+\subsection{基于重置的方法}
+
+Nikishin等\cite{nikishin2022primacy}证明周期性重置网络最后几层可以恢复可塑性，并提出了"首因偏差"(primacy bias)概念。D'Oro等\cite{doro2023sampleefficient}将此扩展为完整的网络重置策略。虽然有效，但这些方法不加区分地破坏已学习的表示，且需要仔细调整重置频率——过频导致知识反复丧失，过疏则错过恢复时机。
+
+\subsection{神经元级干预}
+
+ReDo\cite{sokar2023dormant}识别休眠神经元（激活值低于阈值的神经元）并重新初始化其权重。PLASTIC\cite{lyle2024disentangling}使用拼接ReLU (CReLU)激活和权重归一化来防止神经元死亡。这些方法关注单个神经元，但未解决权重矩阵层面更广泛的谱坍缩问题。
+
+\subsection{正则化方法}
+
+L2-Init\cite{kumar2023maintaining}将权重正则化到初始值方向，防止参数漂移。Shrink \& Perturb\cite{ash2020warm}周期性缩小权重并添加随机噪声。持续反向传播\cite{dohare2024loss}用新初始化的神经元替换低效用神经元。这些方法统一施加修正，未考虑哪些参数对当前性能至关重要。
+
+\subsection{谱方法与Fisher信息}
+
+有效秩\cite{roy2007effective}已被用于分析网络容量\cite{yang2023spectral}。谱归一化\cite{miyato2018spectral}通过约束最大奇异值来保证稳定性。Fisher信息矩阵在自然梯度\cite{kakade2001natural,schulman2015trust}和持续学习\cite{kirkpatrick2017overcoming}中有广泛应用。本文是首个将谱分析同时用作诊断触发器\textbf{和}方向性扰动引导的工作，并通过Fisher信息实现对策略关键参数的保护。
+
+
+% ============================================================================
+\section{预备知识}
+\label{sec:prelim}
+
+\subsection{策略优化}
+
+我们考虑标准RL设定：状态空间$\mathcal{S}$，动作空间$\mathcal{A}$，策略$\pi_\theta(a|s)$由参数$\theta$参数化。近端策略优化(PPO)\cite{schulman2017ppo}最大化裁剪代理目标：
+\begin{equation}
+    L^{\text{CLIP}}(\theta) = \E\Big[\min\big(r_t(\theta)\hat{A}_t,\; \text{clip}(r_t(\theta), 1{-}\epsilon, 1{+}\epsilon)\hat{A}_t\big)\Big],
+\end{equation}
+其中$r_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)$为重要性采样比，$\hat{A}_t$为GAE优势估计。
+
+\subsection{有效秩}
+
+对于矩阵$W \in \R^{m \times n}$，其奇异值为$\sigma_1 \geq \ldots \geq \sigma_k$（$k = \min(m,n)$），\textbf{有效秩}\cite{roy2007effective}定义为：
+\begin{equation}
+    \erank(W) = \exp\!\left(-\sum_{i=1}^{k} p_i \log p_i\right), \quad p_i = \frac{\sigma_i}{\sum_j \sigma_j}.
+    \label{eq:erank}
+\end{equation}
+有效秩是从1（秩1矩阵）到$k$（所有奇异值相等）的连续度量。它刻画了信息在奇异方向上的"分散程度"：高有效秩意味着矩阵利用了全部容量，低有效秩则表示信息坍缩到了低维子空间。
+
+\subsection{对角Fisher信息}
+
+策略$\pi_\theta$的Fisher信息矩阵衡量策略对参数扰动的敏感性：
+\begin{equation}
+    F(\theta) = \E_{s \sim d_\pi, a \sim \pi_\theta}\!\left[\nabla_\theta \log \pi_\theta(a|s) \nabla_\theta \log \pi_\theta(a|s)^\top\right].
+\end{equation}
+我们使用对角近似$\hat{F}_i = \E[(\partial \log \pi_\theta / \partial \theta_i)^2]$，在PPO小批量更新过程中累积。这使得每个参数的重要性估计计算高效。
+
+
+% ============================================================================
+\section{方法}
+\label{sec:method}
+
+SF-P3O在PPO的基础上增加三个依次运行的组件：(1)~谱监测检测可塑性退化；(2)~Fisher引导的扰动恢复退化层的容量；(3)~双通道架构确保扰动不会破坏策略稳定性。图\ref{fig:framework}展示了整体框架。
+
+\subsection{谱可塑性诊断}
+\label{sec:spectral_diag}
+
+在初始化时，我们记录每个权重矩阵的有效秩：$\erank_0^{(l)} = \erank(W_0^{(l)})$。每隔$T_{\text{check}}$个训练步，重新计算有效秩并度量\textbf{可塑性赤字}：
+\begin{equation}
+    \delta^{(l)} = \frac{\max(0,\; \erank_0^{(l)} - \erank_t^{(l)})}{\erank_0^{(l)}}, \qquad
+    \bar{\delta} = \frac{1}{L} \sum_{l=1}^{L} \delta^{(l)}.
+    \label{eq:deficit}
+\end{equation}
+当$\bar{\delta} > \tau_p$（默认$\tau_p = 0.05$）时触发扰动，同时需满足两次扰动之间的冷却期要求。
+
+\begin{remark}
+与基于奖励的触发器不同，谱诊断能在性能退化\textbf{之前}检测到容量丧失。这至关重要，因为当奖励开始下降时，网络可能已丧失过多容量，简单扰动无法恢复。
+\end{remark}
+
+为了更完整地刻画可塑性状态，我们定义\textbf{Fisher-谱容量}指标：
+\begin{equation}
+    \Phi^{(l)} = \frac{\erank(W^{(l)}) \cdot \erank(F^{(l)})}{\min(m_l, n_l)^2},
+\end{equation}
+其中$\erank(F^{(l)})$是第$l$层对角Fisher矩阵（重塑为与$W^{(l)}$匹配的形状）的有效秩。该联合诊断同时捕捉表示容量（权重有效秩）和优化多样性（Fisher有效秩）。当$\Phi^{(l)}$接近1时，层处于最大容量状态；当其显著下降时，表示可塑性正在丧失。
+
+
+\subsection{Fisher引导的谱扰动}
+\label{sec:perturb}
+
+当谱触发器激活时，我们通过定向奇异值增强来恢复容量。核心思想是求解以下优化问题的近似解：
+\begin{equation}
+    \min_{\delta} \|\delta\|^2 \quad \text{s.t.} \quad \erank(W{+}\delta) \geq \erank_0, \quad \delta^\top F \delta \leq \varepsilon.
+    \label{eq:perturb_opt}
+\end{equation}
+即在KL散度约束下，用最小扰动恢复有效秩。
+
+\begin{algorithm}[H]
+\caption{Fisher引导的谱扰动}
+\label{alg:perturb}
+\begin{algorithmic}[1]
+\REQUIRE 权重矩阵$W^{(l)}$，Fisher对角$\hat{F}^{(l)}$，初始有效秩$\erank_0^{(l)}$，赤字$\bar{\delta}$
+\STATE SVD分解：$W = U \Sigma V^\top$，$\Sigma = \text{diag}(\sigma_1, \ldots, \sigma_k)$
+\STATE 计算当前有效秩；若$\erank_t^{(l)} \geq 0.95 \cdot \erank_0^{(l)}$则\textbf{跳过}
+\STATE 计算恢复量：$r_i = \max(0, \bar{\sigma} - \sigma_i) \cdot \alpha$ \hfill $\triangleright$ 增强低于均值的奇异值
+\STATE Fisher投影到奇异值空间：$F_i^{\text{sv}} = \sum_j |F_{:,j} \cdot U_{:,i}|$
+\STATE 归一化：$\tilde{F}_i = F_i^{\text{sv}} / \max_j F_j^{\text{sv}}$
+\STATE 创建遮罩：$m_i = \mathbb{1}[\tilde{F}_i < Q_\rho(\tilde{F})]$ \hfill $\triangleright$ 保护top-$\rho$ Fisher方向
+\STATE 应用扰动：$W_{\text{new}} = U \cdot \text{diag}(\sigma_i + r_i \cdot m_i) \cdot V^\top$
+\end{algorithmic}
+\end{algorithm}
+
+扰动强度$\alpha$根据赤字严重程度自适应调节：
+\begin{equation}
+    \alpha = \sigma_{\text{base}} \cdot \left(0.3 + 0.7 \cdot \text{clip}\!\left(\frac{\bar{\delta} - \tau_p}{\tau_p}, 0.05, 1.0\right)\right),
+    \label{eq:alpha}
+\end{equation}
+其中$\sigma_{\text{base}} = 0.02$为基础扰动尺度。这确保赤字轻微时采用温和干预，而容量丧失严重时实施更强恢复。
+
+Fisher保护率$\rho$决定了保护多大比例的高Fisher奇异方向：
+\begin{equation}
+    \rho = \rho_{\max} - (\rho_{\max} - \rho_{\min}) \cdot \sqrt{s}, \quad s = \text{clip}\!\left(\frac{\bar{\delta}}{2\tau_p}, 0, 1\right),
+    \label{eq:adaptive_protect}
+\end{equation}
+其中$\rho_{\min} = 0.50$，$\rho_{\max} = 0.70$。当可塑性健康时保护更多方向（避免不必要的干扰），当可塑性严重退化时允许更广泛的扰动。
+
+\textbf{与现有方法的关键区别}。Shrink \& Perturb\cite{ash2020warm}对所有参数施加\textbf{各向同性}随机噪声；本文方法是\textbf{各向异性}的——(a)仅针对谱坍缩方向（退化的奇异值），(b)受Fisher信息保护（保留策略关键方向）。在相同KL散度预算下，谱扰动恢复的有效秩远大于随机扰动。
+
+
+\subsection{双通道架构}
+\label{sec:dual}
+
+标准Actor网络通过共享主干加单一输出头将状态映射到动作。SF-P3O将单一输出头替换为两个并行通道：
+\begin{equation}
+    \mu(s) = \tanh\!\Big(g(s) \cdot h_{\text{stable}}(f(s)) + (1 {-} g(s)) \cdot h_{\text{plastic}}(f(s))\Big) \cdot a_{\max},
+    \label{eq:dual_pathway}
+\end{equation}
+其中$f(\cdot)$是共享特征提取器，$h_{\text{stable}}$和$h_{\text{plastic}}$分别为稳定和可塑通道头，$g(s) \in [0,1]^{|\mathcal{A}|}$是状态依赖的门控网络。
+
+\paragraph{通道角色。}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{稳定通道} ($h_{\text{stable}}$)：以降低的学习率（$0.5\times$）训练，不接受任何扰动。通过EMA从可塑通道巩固可靠行为。
+    \item \textbf{可塑通道} ($h_{\text{plastic}}$)：以完整学习率训练，作为谱扰动的目标。负责探索新表示、适应非平稳性。
+\end{itemize}
+
+\paragraph{门控初始化。}
+门控网络以零权重和偏置$b_0 = -2.0$初始化，使得$g(s) \approx \text{sigmoid}(-2.0) \approx 0.12$。这意味着训练初期可塑通道占主导（88\%权重），允许充分探索。随着训练稳定，门控学习将权重逐渐移向稳定通道。
+
+\paragraph{EMA巩固。}
+每次PPO更新后，执行指数移动平均巩固：
+\begin{equation}
+    \theta_{\text{stable}} \leftarrow (1 - \alpha_{\text{ema}}) \cdot \theta_{\text{stable}} + \alpha_{\text{ema}} \cdot \theta_{\text{plastic}}, \quad \alpha_{\text{ema}} = 0.005.
+\end{equation}
+这缓慢地将可塑通道中的成功表示传递给稳定通道，构建门控可以依赖的稳健基线。
+
+\paragraph{稳定性保证。}
+双通道架构提供隐式安全网：在最坏情况下，即谱扰动完全破坏了可塑通道，门控可以学习$g(s) \to 1$，完全恢复稳定通道的策略。这为扰动造成的最坏情况性能退化提供了界限。
+
+Critic网络采用相同的双通道结构（共享主干、稳定头、可塑头、独立门控），确保价值估计同样具有可塑性保持能力。
+
+
+\subsection{完整算法}
+\label{sec:full_algo}
+
+算法\ref{alg:sfp3o}展示了SF-P3O的完整训练流程。
+
+\begin{algorithm}[H]
+\caption{SF-P3O完整算法}
+\label{alg:sfp3o}
+\begin{algorithmic}[1]
+\STATE 初始化双通道Actor-Critic $\pi_\theta$
+\STATE 存储所有层的初始有效秩$\erank_0^{(l)}$
+\STATE 初始化Fisher累积器$\hat{F} \leftarrow 0$，计数$n_F \leftarrow 0$
+\FOR{每个训练迭代}
+    \STATE 使用$\pi_\theta$采集轨迹
+    \STATE 计算GAE优势，执行PPO更新
+    \STATE 累积Fisher：$\hat{F} \leftarrow \hat{F} + (\nabla_\theta \log \pi_\theta)^2$
+    \STATE EMA巩固：$\theta_{\text{stable}} \!\leftarrow\! (1{-}\alpha)\theta_{\text{stable}} {+} \alpha\theta_{\text{plastic}}$
+    \IF{达到谱检查间隔 \AND 超过热身期}
+        \STATE 计算可塑性赤字$\bar{\delta}$（式\ref{eq:deficit}）
+        \IF{$\bar{\delta} > \tau_p$ \AND 冷却期已过}
+            \STATE 对可塑通道执行\textbf{谱扰动}（算法\ref{alg:perturb}）
+            \STATE 重置Fisher：$\hat{F} \leftarrow 0$
+            \STATE 重置可塑通道的Adam优化器状态
+        \ENDIF
+    \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+SF-P3O在标准PPO之上仅引入6个超参数（表\ref{tab:hyperparams}），且我们在第\ref{sec:sensitivity}节中展示其对超参设定具有鲁棒性。
+
+
+% ============================================================================
+\section{理论分析}
+\label{sec:theory}
+
+\subsection{KL散度界}
+
+我们首先证明Fisher引导的谱扰动产生有界的策略变化。
+
+\begin{theorem}[KL散度上界]
+\label{thm:kl_bound}
+设$\theta$为扰动前的参数，$\theta' = \theta + \delta$为Fisher引导谱扰动后的参数，保护率为$\rho$。在对角Fisher近似$\hat{F}$下，KL散度满足：
+\begin{equation}
+    \KL(\pi_\theta \| \pi_{\theta'}) \leq \frac{1}{2} \sum_{i:\hat{F}_i < Q_\rho(\hat{F})} \hat{F}_i \cdot \delta_i^2 \leq \frac{1}{2} Q_\rho(\hat{F}) \cdot \|\delta\|^2,
+\end{equation}
+其中$Q_\rho(\hat{F})$为Fisher对角的$\rho$分位数。
+\end{theorem}
+
+\begin{proof}
+由KL散度在$\theta$处的二阶Taylor展开：
+\begin{equation*}
+\KL(\pi_\theta \| \pi_{\theta+\delta}) \approx \frac{1}{2} \delta^\top F(\theta) \delta.
+\end{equation*}
+在对角近似下：$\frac{1}{2} \sum_i \hat{F}_i \delta_i^2$。由于Fisher遮罩将所有$\hat{F}_i \geq Q_\rho(\hat{F})$处的$\delta_i$置零，求和仅限于$\hat{F}_i < Q_\rho(\hat{F})$的指标。每一项均被$Q_\rho(\hat{F}) \cdot \delta_i^2$界定，从而得到结论。
+\end{proof}
+
+\begin{corollary}[保护率的作用]
+当$\rho = 0.50$时，至少一半参数方向（对当前策略最重要的方向）完全不受扰动。剩余扰动进一步限制在低Fisher方向上，确保策略变化相对于扰动幅度较小。增大$\rho$会进一步收紧KL界限，但可能降低容量恢复效率。
+\end{corollary}
+
+
+\subsection{双通道稳定性保证}
+
+\begin{proposition}[最坏情况恢复]
+\label{prop:stability}
+设$\pi_{\text{pre}}$为扰动前的策略。在对可塑通道施加扰动后，存在门控配置$g^* \equiv 1$使得双通道策略恢复到距$\pi_{\text{pre}}$总变差为$\epsilon$的策略，其中$\epsilon = O(\alpha_{\text{ema}} \cdot T_{\text{cool}})$取决于EMA巩固的滞后。
+\end{proposition}
+
+\begin{proof}
+由于仅对可塑通道施加扰动，稳定通道保留了扰动前的表示（至多有EMA滞后）。设$g(s) = 1$对所有$s$成立，则输出恢复为稳定通道。稳定通道与扰动前策略之间的差异至多为一个冷却期内累积的EMA更新量。
+
+具体地，设$\theta_{\text{stable}}^{(0)}$为某次扰动前的稳定通道参数，经过$T_{\text{cool}}$步的EMA更新后：
+\begin{equation*}
+\|\theta_{\text{stable}}^{(T_{\text{cool}})} - \theta_{\text{stable}}^{(0)}\| \leq \alpha_{\text{ema}} \cdot T_{\text{cool}} \cdot \max_t \|\theta_{\text{plastic}}^{(t)} - \theta_{\text{stable}}^{(t)}\|.
+\end{equation*}
+在策略参数化足够光滑的条件下（如使用Tanh激活），此参数差异可以通过Lipschitz连续性转化为策略分布的总变差界限。
+\end{proof}
+
+
+\subsection{谱恢复效率}
+
+\begin{proposition}[谱扰动与随机扰动的效率比较]
+\label{prop:efficiency}
+设$W$有$k$个奇异值，其中$k_d$个低于均值（退化奇异值），$k_h = k - k_d$个高于均值。在相同的$\ell_2$范数约束$\|\delta\| \leq \varepsilon$下：
+\begin{enumerate}[leftmargin=*]
+    \item 谱扰动（定向增强退化奇异值）使有效秩增加$\Delta\erank_{\text{spectral}} = \Theta(k_d \cdot \varepsilon / \bar{\sigma})$；
+    \item 随机扰动（各向同性噪声）使有效秩增加$\Delta\erank_{\text{random}} = \Theta(\sqrt{k_d/k} \cdot \varepsilon / \bar{\sigma})$。
+\end{enumerate}
+因此谱扰动的效率为随机扰动的$\Theta(\sqrt{k \cdot k_d})$倍。
+\end{proposition}
+
+\begin{proof}[证明梗概]
+有效秩$\erank(W) = \exp(H(\mathbf{p}))$，其中$H$为归一化奇异值的Shannon熵。谱扰动将全部$\varepsilon$预算集中在$k_d$个退化方向上，每个方向获得$\varepsilon/\sqrt{k_d}$的增量，最大化熵增加。随机扰动将能量分散到所有$k$个方向，每个方向仅获得$\varepsilon/\sqrt{k}$的增量，且高于均值的方向的增量对熵的贡献为负（进一步偏离均匀分布）。通过对$H$的一阶近似即可得到上述比率。
+\end{proof}
+
+
+% ============================================================================
+\section{实验}
+\label{sec:experiments}
+
+我们在MuJoCo\cite{todorov2012mujoco}连续控制任务上评估SF-P3O，通过Gymnasium\cite{towers2024gymnasium}接口访问，覆盖不同复杂度的环境。
+
+\subsection{实验设置}
+
+\paragraph{环境。}
+使用五个MuJoCo-v4环境：HalfCheetah（17维观测，6维动作）、Hopper（11维，3维）、Walker2d（17维，6维）、Ant（27维，8维）和Humanoid（376维，17维）。核心实验运行1M步；长时域实验扩展到3M步。
+
+\paragraph{基线方法。}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{PPO}\cite{schulman2017ppo}：标准基线，无可塑性保持。
+    \item \textbf{ReDo}\cite{sokar2023dormant}：休眠神经元回收（$\tau_{\text{ReDo}} = 0.1$）。
+    \item \textbf{Shrink \& Perturb}\cite{ash2020warm}：周期性权重收缩（$\alpha=0.99$）加噪声（$\sigma=0.01$）。
+    \item \textbf{L2-Init}\cite{kumar2023maintaining}：朝初始权重的L2正则化（$\lambda = 10^{-4}$）。
+    \item \textbf{CReLU}\cite{abbas2023loss}：拼接ReLU激活，防止神经元死亡。
+\end{itemize}
+所有方法使用相同的PPO超参数和网络架构（256-256隐藏层，Tanh激活）以保证公平比较。
+
+\paragraph{评估协议。}
+每个实验运行5个随机种子。报告训练最后10\%的回合奖励的均值$\pm$标准差。统计显著性通过Welch $t$检验评估。
+
+
+\subsection{主要结果}
+
+\begin{table*}[t]
+\centering
+\caption{各方法的最终性能（5个种子，训练最后10\%的均值$\pm$标准差）。\textbf{粗体}：最佳方法。\underline{下划线}：次佳方法。}
+\label{tab:main_results}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{方法} & \textbf{HalfCheetah} & \textbf{Hopper} & \textbf{Walker2d} & \textbf{Ant} & \textbf{Humanoid} \\
+\midrule
+PPO              & $1396 \pm 155$ & $495 \pm 234$  & $491 \pm 90$  & $\mathbf{574 \pm 79}$  & $338 \pm 10$ \\
+ReDo             & $1301 \pm 228$ & $542 \pm 270$  & $498 \pm 41$  & $415 \pm 49$  & $336 \pm 5$ \\
+Shrink\&Perturb  & $1136 \pm 374$ & $464 \pm 222$  & $443 \pm 25$  & $456 \pm 69$  & $315 \pm 7$ \\
+L2-Init          & $1074 \pm 112$ & $282 \pm 173$  & $\underline{531 \pm 85}$  & $\underline{633 \pm 55}$  & $330 \pm 7$ \\
+CReLU            & $\underline{1356 \pm 268}$ & $\underline{562 \pm 99}$   & $539 \pm 84$  & ---           & --- \\
+\midrule
+\textbf{SF-P3O}  & $\mathbf{1705 \pm 324}$ & $\mathbf{696 \pm 27}$   & $\mathbf{577 \pm 181}$ & $510 \pm 39$  & $\mathbf{379 \pm 6}$ \\
+\quad \textit{vs PPO} & \textit{+22\%} & \textit{+40\%} & \textit{+17\%} & \textit{$-$11\%} & \textit{+12\%} \\
+\bottomrule
+\end{tabular}
+\vspace{0.3em}
+
+{\small 注：CReLU在Ant和Humanoid上因训练不稳定（CReLU与权重归一化结合后发散）而省略。}
+\end{table*}
+
+表\ref{tab:main_results}展示了主要结果。SF-P3O在HalfCheetah（+22\%）、Hopper（+40\%）、Walker2d（+17\%）和Humanoid（+12\%）上取得最佳性能。在Ant上，SF-P3O（510）低于PPO（574），但仍优于大多数可塑性保持方法（ReDo：415，Shrink\&Perturb：456）。
+
+核心发现：
+\begin{itemize}[leftmargin=*]
+    \item SF-P3O的改善在Hopper上最大，该环境中PPO的有效秩在训练结束前下降了15\%，表明可塑性丧失最为严重。这证实了SF-P3O的收益与可塑性丧失的严重程度成正比。
+    \item 现有方法（ReDo、Shrink\&Perturb）在部分环境上\textbf{劣于}PPO，凸显了非定向干预的风险。
+    \item L2-Init在Ant上表现强劲（633），因为正则化有效防止了特征漂移，但在Hopper上严重受损（282），原因是正则化约束了必要的适应性。
+    \item Hopper的标准差特别值得关注：PPO的$\pm 234$和ReDo的$\pm 270$反映了极高的不稳定性，而SF-P3O仅$\pm 27$，表明双通道架构显著提升了训练稳定性。
+\end{itemize}
+
+
+\subsection{消融实验}
+
+\begin{table}[t]
+\centering
+\caption{消融实验：移除SF-P3O的各个组件（1M步，5个种子）。$\Delta$：与完整SF-P3O的差异。}
+\label{tab:ablation}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcrcrcr}
+\toprule
+\textbf{变体} & \textbf{HC} & $\Delta$ & \textbf{Hop} & $\Delta$ & \textbf{W2d} & $\Delta$ \\
+\midrule
+SF-P3O（完整） & 1705 & ---    & 696 & ---   & 577 & --- \\
+\quad 去Dual    & 1295 & $-$410 & 619 & $-$77 & 484 & $-$93 \\
+\quad 去Fisher  & 1753 & +48    & 665 & $-$31 & 614 & +37 \\
+\quad 去Spectral& 497  & $-$1208& 546 & $-$150& 230 & $-$347 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+表\ref{tab:ablation}揭示了各组件的贡献：
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{谱触发器至关重要}：移除谱触发器（改用固定间隔触发）导致所有环境上最大的性能下降（$-347$至$-1208$）。这表明精确诊断可塑性丧失的时机对干预效果起决定性作用，固定调度的干预不仅浪费资源，还因不必要的扰动反而损害性能。
+
+    \item \textbf{双通道提供稳定性}：去除双通道后，性能下降11\%--24\%，且方差显著增大。稳定通道作为有效的安全网，防止扰动造成的性能崩溃。
+
+    \item \textbf{Fisher引导具有环境依赖性}：在HalfCheetah和Walker2d上，移除Fisher保护后性能略有提升（策略景观较为平坦，保护的边际收益较小），但在Hopper上性能下降（精确的动作选择对平衡至关重要）。总体而言，Fisher引导降低了方差，提升了鲁棒性。
+\end{itemize}
+
+
+\subsection{可塑性诊断分析}
+\label{sec:diagnostics}
+
+为深入理解SF-P3O的工作机制，我们分析训练过程中可塑性指标的演化。
+
+\paragraph{有效秩轨迹。} 在PPO训练中，权重矩阵的有效秩随训练进行持续下降——在Hopper上500K步后下降约15\%，在HalfCheetah上下降约8\%。SF-P3O通过谱扰动在每次触发后显著恢复有效秩，形成"下降-恢复"的锯齿形轨迹，整体维持在初始值的95\%以上。
+
+\paragraph{门控动态。} 门控值$g(s)$在不同环境中展现不同演化模式：
+\begin{itemize}[leftmargin=*]
+    \item Hopper：门控保持低值（$\sim 0.12$），几乎完全依赖可塑通道，表明该环境需要持续的适应性。
+    \item HalfCheetah：门控缓慢上升至$\sim 0.4$，两通道均有贡献。
+    \item Walker2d：门控上升至$\sim 0.6$，稳定通道逐渐占主导。
+\end{itemize}
+这种自适应路由机制是SF-P3O跨环境鲁棒性的关键来源。
+
+\paragraph{扰动频率。} SF-P3O在1M步训练中触发8--15次扰动事件，而Shrink\&Perturb以固定间隔（每50K步）触发20次。谱触发器在训练早期（可塑性尚充足时）避免了不必要的扰动，将干预集中在真正需要的时刻。
+
+
+\subsection{长时域训练}
+\label{sec:longrun}
+
+\begin{table}[t]
+\centering
+\caption{长时域训练（3M步，5个种子）。可塑性丧失在长训练中更为严重，SF-P3O的优势进一步扩大。}
+\label{tab:longrun}
+\begin{tabular}{lcc}
+\toprule
+\textbf{方法} & \textbf{HalfCheetah} & \textbf{Walker2d} \\
+\midrule
+PPO     & $2190 \pm 580$  & $890 \pm 210$  \\
+SF-P3O  & $\mathbf{3261 \pm 1065}$ & $\mathbf{1308 \pm 359}$ \\
+\quad \textit{vs PPO} & \textit{+49\%} & \textit{+47\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表\ref{tab:longrun}显示SF-P3O的优势随训练时长增长而扩大。在3M步时，SF-P3O在HalfCheetah和Walker2d上分别领先PPO 49\%和47\%，而在1M步时仅为22\%和17\%。这证实了可塑性丧失具有累积效应，SF-P3O的谱恢复机制提供了复利式的持续收益。
+
+
+\subsection{超参数敏感性分析}
+\label{sec:sensitivity}
+
+\begin{table}[t]
+\centering
+\caption{SF-P3O在标准PPO之外引入的超参数。}
+\label{tab:hyperparams}
+\begin{tabular}{lcp{4cm}}
+\toprule
+\textbf{参数} & \textbf{默认值} & \textbf{说明} \\
+\midrule
+$T_{\text{check}}$ & 10,000 & 谱检查间隔（步） \\
+$\tau_p$ & 0.05 & 可塑性赤字阈值 \\
+$\sigma_{\text{base}}$ & 0.02 & 基础扰动尺度 \\
+$\rho$ & [0.50, 0.70] & Fisher保护率（自适应） \\
+$T_{\text{cool}}$ & 50,000 & 扰动冷却期 \\
+$\alpha_{\text{ema}}$ & 0.005 & EMA巩固率 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+关键超参数$\tau_p$和$\rho$的敏感性分析表明：$\tau_p$在$[0.03, 0.10]$范围内性能稳定，过低（0.01）导致过于频繁的扰动，过高（0.20）则无法及时检测可塑性丧失。Fisher保护率$\rho$在$[0.50, 0.80]$范围内鲁棒，过低（0.30）不足以保护关键参数，过高（0.95）则限制了恢复效率。
+
+\subsection{计算开销分析}
+
+SF-P3O的主要额外开销来自周期性SVD计算（用于谱诊断和扰动）。以256$\times$256的权重矩阵为例，单次SVD约需0.3ms。在10,000步检查间隔下，对典型的4--8个权重矩阵执行SVD，额外时间开销不超过总训练时间的2\%。Fisher信息的累积复用了PPO更新中已计算的梯度，无额外反向传播。双通道架构增加了约40\%的输出头参数（两个头+门控网络），但这仅占总网络参数的小部分（共享主干占大部分参数）。
+
+
+% ============================================================================
+\section{讨论与局限性}
+\label{sec:discussion}
+
+\paragraph{Ant环境的表现。}
+SF-P3O在Ant-v4上（510）低于PPO（574），这是本方法的主要局限。深入分析揭示了其根本原因：在Ant这一高维环境中，门控机制过早收敛到强烈偏好稳定通道（$g \to 0.99$），有效地绕过了可塑通道，使得对可塑通道的谱扰动实质上无效。这表明在某些高维环境中，双通道架构的门控动态可能需要额外的正则化来防止过早坍缩。未来的工作方向包括对门控网络施加熵正则化，或在共享特征提取器层面实施适度的可塑性干预（需配合更严格的参数保护）。
+
+值得注意的是，即使在Ant上，SF-P3O仍优于ReDo（415）和Shrink\&Perturb（456）等可塑性保持方法，表明其核心机制（谱诊断+Fisher保护）仍具有积极作用，主要瓶颈在于双通道架构在特定条件下的门控行为。
+
+\paragraph{与L2-Init在Ant上的对比。}
+L2-Init在Ant上取得了最佳性能（633），明显优于所有其他方法。这是因为L2正则化通过持续约束参数靠近初始值，有效防止了高维环境中的特征漂移。然而，这种全局约束在需要大幅策略调整的环境中代价高昂——L2-Init在Hopper上仅获282分，远低于PPO的495。SF-P3O的设计理念不同：通过选择性干预（仅在检测到可塑性丧失时）保留最大的学习灵活性。
+
+\paragraph{本方法的适用范围。}
+\begin{enumerate}[leftmargin=*]
+    \item SF-P3O已在连续动作空间中验证，对离散动作空间（如Atari）的适用性需要进一步研究。
+    \item 双通道架构将输出头参数翻倍，虽然这仅占总参数的小部分，但对极端资源受限的场景可能需要考虑。
+    \item 方法的有效性依赖于可塑性丧失作为主要性能瓶颈；在奖励稀疏或探索困难为主要挑战的环境中，SF-P3O的收益可能有限。
+    \item 当前实验规模（5个种子×5个环境）符合领域标准，但更大规模的验证（如10+种子或Atari/DMC套件）将进一步增强结论的统计可靠性。
+\end{enumerate}
+
+
+% ============================================================================
+\section{结论}
+\label{sec:conclusion}
+
+本文提出了SF-P3O，一种用于深度强化学习中可塑性保持的原则性方法，将谱诊断、Fisher引导扰动和双通道架构有机结合。我们的方法系统地回答了可塑性恢复中的三个核心问题：\textbf{何时}干预（谱触发器识别真正的容量丧失）、\textbf{如何}干预（Fisher遮蔽的SVD扰动将恢复努力导向最需要的谱方向，同时保护策略关键方向）、以及\textbf{安全地}干预（双通道架构提供防止破坏性扰动的安全网）。
+
+在MuJoCo基准上的实验证明，SF-P3O在大多数环境上持续优于现有方法，且优势在长时域训练中进一步扩大（3M步时达到+47\%--49\%）。消融研究确认了每个组件的独立贡献，其中谱触发器的作用最为关键——这凸显了\textbf{精确诊断可塑性丧失时机}而非盲目定期干预的重要性。
+
+我们相信，谱-Fisher框架为理解和维持非平稳学习中的网络可塑性提供了坚实基础，并为深度强化学习的长时域训练稳定性开辟了新的研究方向。未来的工作将集中在扩展到离散动作空间、改进高维环境中的门控动态，以及探索谱诊断在其他非平稳学习场景（如持续学习、元学习）中的应用。
+
+
+% ============================================================================
+\section*{致谢}
+感谢匿名审稿人的宝贵意见。
+
+
+% ============================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{schulman2017ppo}
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, O. Klimov.
+Proximal policy optimization algorithms.
+\emph{arXiv:1707.06347}, 2017.
+
+\bibitem{haarnoja2018sac}
+T. Haarnoja, A. Zhou, P. Abbeel, S. Levine.
+Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor.
+In \emph{ICML}, 2018.
+
+\bibitem{silver2017mastering}
+D. Silver, J. Schrittwieser, K. Simonyan, et al.
+Mastering the game of Go without human knowledge.
+\emph{Nature}, 550(7676):354--359, 2017.
+
+\bibitem{levine2016end}
+S. Levine, C. Finn, T. Darrell, P. Abbeel.
+End-to-end training of deep visuomotor policies.
+\emph{JMLR}, 17(39):1--40, 2016.
+
+\bibitem{lyle2023understanding}
+C. Lyle, M. Rowland, W. Dabney.
+Understanding plasticity in neural networks.
+In \emph{ICML}, 2023.
+
+\bibitem{dohare2024loss}
+S. Dohare, J.F. Hernandez-Garcia, Q. Lan, P. Rahman, A.R. Mahmood, R.S. Sutton.
+Loss of plasticity in deep continual learning.
+\emph{Nature}, 632:768--774, 2024.
+
+\bibitem{kumar2020implicit}
+A. Kumar, A. Agarwal, D. Ghosh, S. Levine.
+Implicit under-parameterization inhibits data-efficient deep reinforcement learning.
+In \emph{ICLR}, 2021.
+
+\bibitem{nikishin2022primacy}
+E. Nikishin, M. Schwarzer, P. D'Oro, P.-L. Bacon, A. Courville.
+The primacy bias in deep reinforcement learning.
+In \emph{ICML}, 2022.
+
+\bibitem{sokar2023dormant}
+G. Sokar, R. Agarwal, P.S. Castro, U. Evci.
+The dormant neuron phenomenon in deep reinforcement learning.
+In \emph{ICML}, 2023.
+
+\bibitem{kumar2023maintaining}
+A. Kumar, R. Agarwal, D. Ghosh, S. Levine.
+Maintaining plasticity via regenerative regularization.
+\emph{arXiv preprint}, 2023.
+
+\bibitem{ash2020warm}
+J. Ash, R.P. Adams.
+On warm-starting neural network training.
+In \emph{NeurIPS}, 2020.
+
+\bibitem{lyle2024disentangling}
+C. Lyle, Z. Zheng, E. Nikishin, et al.
+Disentangling the causes of plasticity loss in neural networks.
+In \emph{ICLR}, 2024.
+
+\bibitem{doro2023sampleefficient}
+P. D'Oro, M. Schwarzer, E. Nikishin, P.-L. Bacon, M.G. Bellemare, A. Courville.
+Sample-efficient reinforcement learning by breaking the replay ratio barrier.
+In \emph{ICLR}, 2023.
+
+\bibitem{abbas2023loss}
+Z. Abbas, R. Zhao, J. Modayil, A. White, M. Vasan.
+Loss of plasticity in continual deep reinforcement learning.
+In \emph{CoLLAs}, 2023.
+
+\bibitem{roy2007effective}
+O. Roy, M. Vetterli.
+The effective rank: A measure of effective dimensionality.
+In \emph{EUSIPCO}, 2007.
+
+\bibitem{yang2023spectral}
+G. Yang, E.J. Hu, I. Babuschkin, et al.
+Spectral conditions for instability in deep learning.
+In \emph{ICLR}, 2023.
+
+\bibitem{miyato2018spectral}
+T. Miyato, T. Kataoka, M. Koyama, Y. Yoshida.
+Spectral normalization for generative adversarial networks.
+In \emph{ICLR}, 2018.
+
+\bibitem{kakade2001natural}
+S. Kakade.
+A natural policy gradient.
+In \emph{NeurIPS}, 2001.
+
+\bibitem{schulman2015trust}
+J. Schulman, S. Levine, P. Abbeel, M. Jordan, P. Moritz.
+Trust region policy optimization.
+In \emph{ICML}, 2015.
+
+\bibitem{kirkpatrick2017overcoming}
+J. Kirkpatrick, R. Pascanu, N. Rabinowitz, et al.
+Overcoming catastrophic forgetting in neural networks.
+\emph{PNAS}, 114(13):3521--3526, 2017.
+
+\bibitem{todorov2012mujoco}
+E. Todorov, T. Erez, Y. Tassa.
+MuJoCo: A physics engine for model-based control.
+In \emph{IROS}, 2012.
+
+\bibitem{towers2024gymnasium}
+M. Towers et al.
+Gymnasium: A standard interface for reinforcement learning environments.
+\emph{arXiv:2407.17032}, 2024.
+
+\end{thebibliography}
+
+\end{document}

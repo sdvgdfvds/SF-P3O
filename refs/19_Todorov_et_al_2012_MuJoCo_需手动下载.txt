@@ -1,0 +1,4 @@
+Todorov, E., Erez, T., & Tassa, Y. (2012). MuJoCo: A physics engine for model-based control.
+DOI: https://doi.org/10.1109/IROS.2012.6386109
+IEEE: https://ieeexplore.ieee.org/document/6386109
+需通过IEEE Xplore或学校VPN下载。

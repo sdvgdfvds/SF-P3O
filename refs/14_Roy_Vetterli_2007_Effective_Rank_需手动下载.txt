@@ -1,0 +1,4 @@
+Roy, O., & Vetterli, M. (2007). The effective rank: A measure of effective dimensionality.
+DOI: https://doi.org/10.1109/EUSIPCO.2007.7098875  
+IEEE: https://ieeexplore.ieee.org/document/7098875
+需通过IEEE Xplore或学校VPN下载。

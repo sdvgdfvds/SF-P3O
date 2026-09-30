@@ -16,12 +16,16 @@ SF-P3O 针对深度强化学习中的可塑性丧失问题，提出三项核心�
 ```
 SF-P3O/
 ├── redraw_figures.py           # 实验图表绘制脚本（从原始CSV数据）
-├── figures/                    # 论文图表（17张PNG）
+├── figures/                    # 论文图表（含合图 PDF/PNG 与 split 分图）
+├── paper/                      # 论文 TeX 源文件
+├── refs/                       # 参考文献 PDF
 ├── data/
-│   ├── sf_p3o_runs/            # 核心实验数据（1M步，5环境×8算法）
-│   ├── sf_p3o_highdim/         # 高维环境数据（Ant, Humanoid）
-│   ├── sf_p3o_longrun/         # 长时域实验数据（3M步）
-│   └── sf_p3o_probe/           # 奖励反转实验数据
+│   ├── sf_p3o_runs/            # 核心实验（v1，1M步）
+│   ├── sf_p3o_highdim/         # 高维环境（Ant, Humanoid）
+│   ├── sf_p3o_longrun/         # 长时域（3M步）
+│   ├── sf_p3o_probe/           # 奖励反转
+│   ├── v2/ v3/ v4/             # 后续版本（runs / longrun / probe）
+│   └── seq_runs/               # 序列实验
 └── README.md
 ```
 

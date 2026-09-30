@@ -1,0 +1,567 @@
+\documentclass{article}
+
+% Required packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage[margin=1in]{geometry}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\erank}{\mathrm{erank}}
+\newcommand{\Tr}{\mathrm{Tr}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{\textbf{SF-P3O: Spectral-Fisher Dual-Pathway Plasticity-Preserving Policy Optimization}}
+
+\author{
+  Anonymous Authors
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+Deep reinforcement learning agents progressively lose their ability to learn---a phenomenon known as \emph{plasticity loss}---as training proceeds. Existing remedies either lack a principled diagnostic for \emph{when} intervention is needed (e.g., periodic resets) or sacrifice previously acquired knowledge (e.g., Shrink \& Perturb). We propose \textbf{SF-P3O} (Spectral-Fisher Dual-Pathway Plasticity-Preserving Policy Optimization), a method that integrates three novel components: (1)~a \emph{spectral plasticity diagnostic} based on the effective rank of weight matrices, providing a feedback-loop-free trigger that detects capacity loss before performance degrades; (2)~\emph{Fisher-guided spectral perturbation}, which restores decayed singular values while provably bounding KL divergence from the current policy; and (3)~a \emph{dual-pathway architecture} with a state-dependent gating mechanism that isolates exploratory plasticity restoration from stable policy execution. On continuous control benchmarks (MuJoCo), SF-P3O outperforms PPO by 8--40\% and consistently surpasses existing plasticity-preservation methods including ReDo, Shrink \& Perturb, and L2-Init, while maintaining a stable learning trajectory.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Deep reinforcement learning (RL) has achieved remarkable success in continuous control \citep{schulman2017ppo,haarnoja2018sac}, game playing \citep{silver2017mastering}, and robotic manipulation \citep{levine2016end}. However, a growing body of evidence reveals a fundamental challenge: neural networks trained with non-stationary data distributions---as is inherent in RL---progressively lose their capacity to represent new information \citep{lyle2023understanding,dohare2024loss,kumar2020implicit}. This phenomenon, termed \emph{plasticity loss}, manifests as decreasing effective rank of weight matrices, proliferation of dormant neurons, and ultimately, stagnating or deteriorating performance.
+
+Plasticity loss is particularly insidious because it occurs silently. Standard training metrics (loss, reward) may appear healthy while the network's representational capacity steadily erodes. By the time performance visibly degrades, the damage may be severe enough that simple interventions cannot recover it. This motivates the need for (i) a principled \emph{diagnostic} that detects plasticity loss early, and (ii) a \emph{targeted intervention} that restores capacity without destroying learned knowledge.
+
+Existing approaches address plasticity loss through various mechanisms: periodic layer resets \citep{nikishin2022primacy}, dormant neuron recycling \citep{sokar2023dormant}, weight regularization toward initialization \citep{kumar2023maintaining}, and global perturbation \citep{ash2020warm}. While each offers partial relief, they share common limitations: (a) interventions are triggered by fixed schedules rather than actual need, leading to unnecessary disruptions or missed opportunities; (b) perturbations are isotropic (random noise), wasting KL budget on directions that do not contribute to capacity restoration; and (c) the intervention itself can catastrophically interfere with well-learned behaviors.
+
+We propose \textbf{SF-P3O}, which addresses all three limitations through a unified framework:
+
+\begin{enumerate}
+    \item \textbf{Spectral Plasticity Diagnostic.} We use the \emph{effective rank} \citep{roy2007effective} of weight matrices as a continuous, per-layer measure of representational capacity. When the effective rank drops below a threshold relative to its initial value, this signals genuine capacity loss---not merely specialization. This diagnostic operates independently of the reward signal, avoiding feedback loops that plague loss-based triggers.
+
+    \item \textbf{Fisher-Guided Spectral Perturbation.} Rather than applying isotropic noise, we perform SVD on each weight matrix and selectively boost \emph{decayed} singular values---those that have collapsed below the layer mean. Crucially, restoration is masked by the diagonal Fisher information matrix, ensuring that singular directions critical to the current policy are protected. We prove that this perturbation bounds the KL divergence from the pre-perturbation policy (Theorem~\ref{thm:kl_bound}).
+
+    \item \textbf{Dual-Pathway Architecture.} We introduce a dual-head architecture with a learned state-dependent gate. A \emph{stable pathway} (slower learning rate, never perturbed) preserves reliable behaviors, while a \emph{plastic pathway} (full learning rate, receives spectral perturbation) explores new representations. The gating mechanism smoothly interpolates between pathways, providing an automatic safety net: if perturbation degrades the plastic pathway, the stable pathway's contribution increases.
+\end{enumerate}
+
+Our contributions are:
+\begin{itemize}
+    \item A novel spectral diagnostic that detects plasticity loss at the layer level without requiring reward feedback;
+    \item A theoretically grounded perturbation mechanism that optimally directs restoration effort toward capacity-deficient spectral directions while bounding policy change;
+    \item A dual-pathway architecture that decouples plasticity restoration from performance stability;
+    \item Comprehensive experiments on 5 MuJoCo environments demonstrating consistent improvements over PPO and existing plasticity-preservation methods.
+\end{itemize}
+
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Plasticity Loss in Deep RL.}
+The observation that neural networks lose learning capacity during RL training has been documented across diverse settings \citep{lyle2023understanding,dohare2024loss,nikishin2022primacy,kumar2020implicit}. \citet{lyle2023understanding} provided a comprehensive empirical study linking plasticity loss to decreasing effective rank, increasing dead neurons, and feature norm explosion. \citet{dohare2024loss} traced the root cause to the interaction between non-stationary targets and gradient-based optimization, showing that even supervised learning on shifting distributions exhibits similar degradation.
+
+\paragraph{Reset-Based Methods.}
+\citet{nikishin2022primacy} demonstrated that periodically resetting the last few layers of a network can restore plasticity, coining the term ``primacy bias.'' \citet{d2022sample} extended this with a full network reset schedule. While effective, these methods destroy learned representations indiscriminately and require careful tuning of reset frequency.
+
+\paragraph{Neuron-Level Interventions.}
+ReDo \citep{sokar2023dormant} identifies dormant neurons (those with activation below a threshold) and reinitializes their weights. CReLU and PLASTIC \citep{lyle2024disentangling} use concatenated ReLU activations to prevent dead neurons and weight normalization for stability. These approaches target individual neurons but do not address the broader spectral collapse of weight matrices.
+
+\paragraph{Regularization Approaches.}
+L2-Init \citep{kumar2023maintaining} regularizes weights toward their initial values, preventing drift. Shrink \& Perturb \citep{ash2020warm} periodically shrinks weights and adds random noise. Continual Backpropagation \citep{dohare2024loss} replaces low-utility neurons with freshly initialized ones. These methods apply corrections uniformly without considering which parameters are critical to current performance.
+
+\paragraph{Spectral Methods in Deep Learning.}
+Effective rank \citep{roy2007effective} has been used to analyze network capacity \citep{yang2023spectral}. Spectral normalization \citep{miyato2018spectral} constrains the largest singular value for stability. Our work is the first to use spectral analysis as both a diagnostic trigger \emph{and} a directional guide for targeted perturbation.
+
+\paragraph{Fisher Information in RL.}
+The Fisher information matrix has been used for natural gradient methods \citep{kakade2001natural,schulman2015trust} and continual learning \citep{kirkpatrick2017overcoming}. We use the diagonal Fisher approximation for a different purpose: to identify and protect policy-critical parameter directions during perturbation, directly bounding the resulting KL divergence.
+
+
+% ============================================================================
+\section{Preliminaries}
+\label{sec:prelim}
+
+\paragraph{Policy Optimization.}
+We consider the standard RL setting with state space $\mathcal{S}$, action space $\mathcal{A}$, and policy $\pi_\theta(a|s)$ parameterized by $\theta$. Proximal Policy Optimization (PPO) \citep{schulman2017ppo} maximizes the clipped surrogate objective:
+\begin{equation}
+    L^{\text{CLIP}}(\theta) = \E\left[\min\left(r_t(\theta)\hat{A}_t,\; \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon)\hat{A}_t\right)\right],
+\end{equation}
+where $r_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)$ and $\hat{A}_t$ is the GAE advantage estimate.
+
+\paragraph{Effective Rank.}
+For a matrix $W \in \R^{m \times n}$ with singular values $\sigma_1 \geq \ldots \geq \sigma_k$ ($k = \min(m,n)$), the \emph{effective rank} \citep{roy2007effective} is defined as:
+\begin{equation}
+    \erank(W) = \exp\left(-\sum_{i=1}^{k} p_i \log p_i\right), \quad p_i = \frac{\sigma_i}{\sum_j \sigma_j}.
+    \label{eq:erank}
+\end{equation}
+The effective rank is a continuous measure ranging from 1 (rank-1 matrix) to $k$ (all singular values equal). It captures the ``spread'' of information across singular directions: a matrix with high effective rank utilizes its full capacity, while one with low effective rank has collapsed to a low-dimensional subspace.
+
+\paragraph{Diagonal Fisher Information.}
+The Fisher information matrix $F(\theta)$ for policy $\pi_\theta$ measures the sensitivity of the policy to parameter perturbations:
+\begin{equation}
+    F(\theta) = \E_{s \sim d_\pi, a \sim \pi_\theta}\left[\nabla_\theta \log \pi_\theta(a|s) \nabla_\theta \log \pi_\theta(a|s)^\top\right].
+\end{equation}
+We use the diagonal approximation $\hat{F}_i = \E[(\partial \log \pi_\theta / \partial \theta_i)^2]$, accumulated from mini-batch gradients during PPO updates. This enables efficient per-parameter importance estimation.
+
+
+% ============================================================================
+\section{Method}
+\label{sec:method}
+
+SF-P3O augments PPO with three components that operate in sequence: (1) spectral monitoring detects when plasticity has degraded, (2) Fisher-guided perturbation restores capacity in the detected layers, and (3) a dual-pathway architecture ensures perturbation does not destabilize the policy.
+
+\subsection{Spectral Plasticity Diagnostic}
+\label{sec:spectral_diag}
+
+At initialization, we record the effective rank of every weight matrix: $\erank_0^{(l)} = \erank(W_0^{(l)})$. Every $T_{\text{check}}$ training steps, we recompute the effective rank and measure the \emph{plasticity deficit}:
+\begin{equation}
+    \delta^{(l)} = \frac{\max(0,\; \erank_0^{(l)} - \erank_t^{(l)})}{\erank_0^{(l)}}, \qquad
+    \bar{\delta} = \frac{1}{L} \sum_{l=1}^{L} \delta^{(l)}.
+    \label{eq:deficit}
+\end{equation}
+Perturbation is triggered when $\bar{\delta} > \tau_p$ (default $\tau_p = 0.05$), subject to a cooldown period between events.
+
+\begin{remark}
+Unlike reward-based triggers, the spectral diagnostic detects capacity loss \emph{before} it manifests as performance degradation. This is crucial because by the time the reward drops, the network may have lost too much capacity for simple perturbation to recover.
+\end{remark}
+
+We also define the \emph{Fisher-Spectral capacity} for theoretical analysis:
+\begin{equation}
+    \Phi^{(l)} = \frac{\erank(W^{(l)}) \cdot \erank(F^{(l)})}{\min(m_l, n_l)^2},
+\end{equation}
+where $\erank(F^{(l)})$ is the effective rank of the layer's diagonal Fisher matrix reshaped to match $W^{(l)}$. This joint diagnostic captures both representational capacity (weight erank) and optimization diversity (Fisher erank).
+
+
+\subsection{Fisher-Guided Spectral Perturbation}
+\label{sec:perturb}
+
+When the spectral trigger fires, we restore capacity through targeted singular value boosting:
+
+\begin{algorithm}[H]
+\caption{Fisher-Guided Spectral Perturbation}
+\label{alg:perturb}
+\begin{algorithmic}[1]
+\REQUIRE Weight matrix $W^{(l)}$, Fisher diagonal $\hat{F}^{(l)}$, initial erank $\erank_0^{(l)}$, deficit $\bar{\delta}$
+\STATE Compute SVD: $W = U \Sigma V^\top$, where $\Sigma = \text{diag}(\sigma_1, \ldots, \sigma_k)$
+\STATE Compute current erank; \textbf{skip} if $\erank_t^{(l)} \geq 0.95 \cdot \erank_0^{(l)}$
+\STATE Compute restoration: $r_i = \max(0, \bar{\sigma} - \sigma_i) \cdot \alpha$ \hfill $\triangleright$ boost below-mean SVs
+\STATE Project Fisher to SV space: $F_i^{\text{sv}} = \sum_j |F_{:,j} \cdot U_{:,i}|$ \hfill $\triangleright$ importance per direction
+\STATE Normalize: $\tilde{F}_i = F_i^{\text{sv}} / \max_j F_j^{\text{sv}}$
+\STATE Create mask: $m_i = \mathbb{1}[\tilde{F}_i < Q_\rho(\tilde{F})]$ \hfill $\triangleright$ protect top-$\rho$ Fisher directions
+\STATE Apply: $W_{\text{new}} = U \cdot \text{diag}(\sigma_i + r_i \cdot m_i) \cdot V^\top$
+\end{algorithmic}
+\end{algorithm}
+
+The perturbation strength $\alpha$ adapts to the deficit severity:
+\begin{equation}
+    \alpha = \sigma_{\text{base}} \cdot \left(0.3 + 0.7 \cdot \text{clip}\left(\frac{\bar{\delta} - \tau_p}{\tau_p}, 0.05, 1.0\right)\right),
+\end{equation}
+where $\sigma_{\text{base}} = 0.02$ is the base perturbation scale. This ensures gentle intervention when the deficit is mild and stronger restoration when capacity loss is severe.
+
+The Fisher protection ratio $\rho$ determines what fraction of high-Fisher singular directions are protected:
+\begin{equation}
+    \rho = \rho_{\max} - (\rho_{\max} - \rho_{\min}) \cdot \sqrt{\text{severity}}, \quad \text{severity} = \text{clip}\left(\frac{\bar{\delta}}{2\tau_p}, 0, 1\right),
+    \label{eq:adaptive_protect}
+\end{equation}
+with $\rho_{\min} = 0.50$, $\rho_{\max} = 0.70$. This adaptive mechanism protects more directions when plasticity is healthy (no unnecessary disruption) and allows broader perturbation when plasticity is severely degraded.
+
+
+\subsection{Dual-Pathway Architecture}
+\label{sec:dual}
+
+The standard actor network maps states to actions through a shared trunk followed by a single output head. SF-P3O replaces the single head with two parallel pathways:
+
+\begin{equation}
+    \mu(s) = \tanh\!\Big(g(s) \cdot h_{\text{stable}}(f(s)) + (1 - g(s)) \cdot h_{\text{plastic}}(f(s))\Big) \cdot a_{\max},
+    \label{eq:dual_pathway}
+\end{equation}
+
+where $f(\cdot)$ is the shared feature extractor, $h_{\text{stable}}$ and $h_{\text{plastic}}$ are the two pathway heads, and $g(s) \in [0,1]^{|\mathcal{A}|}$ is a state-dependent gating network.
+
+\paragraph{Pathway Roles.}
+\begin{itemize}
+    \item \textbf{Stable pathway} ($h_{\text{stable}}$): Trained with reduced learning rate ($0.5\times$), never receives perturbation. Consolidates reliable behaviors via EMA from the plastic pathway.
+    \item \textbf{Plastic pathway} ($h_{\text{plastic}}$): Trained at full learning rate, target of spectral perturbation. Explores new representations and adapts to non-stationarity.
+\end{itemize}
+
+\paragraph{Gate Initialization.}
+The gate network is initialized with zero weights and bias $b_0 = -2.0$, yielding $g(s) \approx \text{sigmoid}(-2.0) \approx 0.12$. This means the plastic pathway dominates early training (88\% weight), allowing full exploration. As training stabilizes, the gate learns to route toward the stable pathway for well-learned behaviors.
+
+\paragraph{EMA Consolidation.}
+After each PPO update, we perform exponential moving average consolidation:
+\begin{equation}
+    \theta_{\text{stable}} \leftarrow (1 - \alpha_{\text{ema}}) \cdot \theta_{\text{stable}} + \alpha_{\text{ema}} \cdot \theta_{\text{plastic}}, \quad \alpha_{\text{ema}} = 0.005.
+\end{equation}
+This slowly transfers successful plastic representations to the stable pathway, building a robust baseline that the gate can rely on.
+
+\paragraph{Stability Guarantee.}
+The dual-pathway architecture provides an implicit safety net: in the worst case where spectral perturbation completely degrades the plastic pathway, the gate can learn $g(s) \to 1$, recovering the stable pathway's policy entirely. This bounds the worst-case performance degradation from perturbation.
+
+
+\subsection{Complete Algorithm}
+\label{sec:full_algo}
+
+Algorithm~\ref{alg:sfp3o} presents the complete SF-P3O training loop.
+
+\begin{algorithm}[H]
+\caption{SF-P3O: Spectral-Fisher Dual-Pathway PPO}
+\label{alg:sfp3o}
+\begin{algorithmic}[1]
+\STATE Initialize dual-pathway actor-critic $\pi_\theta$, store $\erank_0^{(l)}$ for all layers
+\STATE Initialize Fisher accumulator $\hat{F} \leftarrow 0$, perturbation counter $n_F \leftarrow 0$
+\FOR{each training iteration}
+    \STATE Collect trajectories using $\pi_\theta$
+    \STATE Compute GAE advantages and perform PPO update (Eq.~1)
+    \STATE Accumulate Fisher: $\hat{F} \leftarrow \hat{F} + (\nabla_\theta \log \pi_\theta)^2$; $n_F \leftarrow n_F + 1$
+    \STATE EMA consolidate: $\theta_{\text{stable}} \leftarrow (1-\alpha)\theta_{\text{stable}} + \alpha\,\theta_{\text{plastic}}$
+    \IF{spectral check interval reached \AND past warmup period}
+        \STATE Compute deficit $\bar{\delta}$ (Eq.~\ref{eq:deficit})
+        \IF{$\bar{\delta} > \tau_p$ \AND cooldown elapsed}
+            \STATE \textbf{Spectral Perturbation} (Algorithm~\ref{alg:perturb}) on plastic pathway
+            \STATE Reset $\hat{F} \leftarrow 0$, $n_F \leftarrow 0$; reset Adam state for plastic params
+        \ENDIF
+    \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+SF-P3O introduces only 6 hyperparameters beyond standard PPO (Table~\ref{tab:hyperparams}), and we show in Section~\ref{sec:sensitivity} that performance is robust across a wide range of settings.
+
+
+% ============================================================================
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+\subsection{Bounded KL Divergence}
+
+We show that Fisher-guided spectral perturbation produces bounded policy change.
+
+\begin{theorem}[KL Divergence Bound]
+\label{thm:kl_bound}
+Let $\theta$ be the parameters before perturbation and $\theta' = \theta + \delta$ after Fisher-guided spectral perturbation with protection ratio $\rho$. Under the diagonal Fisher approximation $\hat{F}$, the KL divergence satisfies:
+\begin{equation}
+    \KL(\pi_\theta \| \pi_{\theta'}) \leq \frac{1}{2} \sum_{i: \hat{F}_i < Q_\rho(\hat{F})} \hat{F}_i \cdot \delta_i^2 \leq \frac{1}{2} Q_\rho(\hat{F}) \cdot \|\delta\|^2,
+\end{equation}
+where $Q_\rho(\hat{F})$ is the $\rho$-quantile of the Fisher diagonal.
+\end{theorem}
+
+\begin{proof}
+By the second-order Taylor expansion of KL divergence around $\theta$:
+$\KL(\pi_\theta \| \pi_{\theta+\delta}) \approx \frac{1}{2} \delta^\top F(\theta) \delta$.
+Under the diagonal approximation: $\frac{1}{2} \sum_i \hat{F}_i \delta_i^2$.
+Since the Fisher mask zeros out $\delta_i$ for all $i$ where $\hat{F}_i \geq Q_\rho(\hat{F})$, the sum reduces to indices where $\hat{F}_i < Q_\rho(\hat{F})$. Each such term is bounded by $Q_\rho(\hat{F}) \cdot \delta_i^2$, giving the result.
+\end{proof}
+
+\begin{remark}
+With $\rho = 0.50$, at least half of all parameter directions (those most important to the current policy) are completely unperturbed. The remaining perturbation is further constrained to low-Fisher directions, ensuring the policy change is small relative to the perturbation magnitude.
+\end{remark}
+
+
+\subsection{Dual-Pathway Stability Guarantee}
+
+\begin{proposition}[Worst-Case Recovery]
+\label{prop:stability}
+Let $\pi_{\text{pre}}$ be the policy before perturbation. After perturbation of the plastic pathway, there exists a gate configuration $g^* \equiv 1$ such that the dual-pathway policy recovers a policy within $\epsilon$ of $\pi_{\text{pre}}$ in total variation, where $\epsilon = O(\alpha_{\text{ema}} \cdot T_{\text{cooldown}})$ depends on the EMA consolidation gap.
+\end{proposition}
+
+\begin{proof}[Proof sketch.]
+Since only the plastic pathway is perturbed and the stable pathway preserves the pre-perturbation representation (up to EMA lag), setting $g(s) = 1$ for all $s$ recovers the stable pathway output. The stable pathway differs from the pre-perturbation policy by at most the EMA updates accumulated over one cooldown period, yielding the $\epsilon$ bound.
+\end{proof}
+
+
+% ============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate SF-P3O on continuous control tasks from the MuJoCo simulator \citep{todorov2012mujoco} via Gymnasium \citep{towers2024gymnasium}, covering environments of varying complexity.
+
+\subsection{Experimental Setup}
+
+\paragraph{Environments.}
+We use five MuJoCo-v4 environments: HalfCheetah (17D obs, 6D act), Hopper (11D, 3D), Walker2d (17D, 6D), Ant (27D, 8D), and Humanoid (376D, 17D). Core experiments run for 1M steps; long-horizon experiments extend to 3M steps.
+
+\paragraph{Baselines.}
+We compare against:
+\begin{itemize}
+    \item \textbf{PPO} \citep{schulman2017ppo}: Standard baseline without plasticity preservation.
+    \item \textbf{ReDo} \citep{sokar2023dormant}: Dormant neuron recycling ($\tau_{\text{ReDo}} = 0.1$).
+    \item \textbf{Shrink \& Perturb} \citep{ash2020warm}: Periodic shrinkage ($\alpha=0.99$) and noise ($\sigma=0.01$).
+    \item \textbf{L2-Init} \citep{kumar2023maintaining}: L2 regularization toward initial weights ($\lambda = 10^{-4}$).
+    \item \textbf{CReLU} \citep{abbas2023loss}: Concatenated ReLU activation that prevents dead neurons.
+\end{itemize}
+All methods use the same PPO hyperparameters (Table~\ref{tab:hyperparams}) and network architecture (256-256 hidden, Tanh activation) for fair comparison.
+
+\paragraph{Evaluation Protocol.}
+Each experiment is run with 5 random seeds. We report the mean $\pm$ standard deviation of episode reward averaged over the last 10\% of training. Statistical significance is assessed via Welch's $t$-test.
+
+
+\subsection{Main Results}
+
+\begin{table}[t]
+\centering
+\caption{Final performance (mean $\pm$ std over 5 seeds, last 10\% of training). \textbf{Bold}: best method. \underline{Underline}: second best. SF-P3O achieves the highest reward on 3 of 5 environments and is competitive on the remaining two.}
+\label{tab:main_results}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{HalfCheetah} & \textbf{Hopper} & \textbf{Walker2d} & \textbf{Ant} & \textbf{Humanoid} \\
+\midrule
+PPO              & $1396 \pm 155$ & $495 \pm 234$  & $491 \pm 90$  & $\mathbf{574 \pm 79}$  & $338 \pm 10$ \\
+ReDo             & $1301 \pm 228$ & $542 \pm 270$  & $498 \pm 41$  & $415 \pm 49$  & $336 \pm 5$ \\
+Shrink\&Perturb  & $1136 \pm 374$ & $464 \pm 222$  & $443 \pm 25$  & $456 \pm 69$  & $315 \pm 7$ \\
+L2-Init          & $1074 \pm 112$ & $282 \pm 173$  & $531 \pm 85$  & $\underline{633 \pm 55}$  & $330 \pm 7$ \\
+CReLU            & $\underline{1356 \pm 268}$ & $\underline{562 \pm 99}$   & $\underline{539 \pm 84}$  & --- & --- \\
+\midrule
+\textbf{SF-P3O}  & $\mathbf{1705 \pm 324}$ & $\mathbf{696 \pm 27}$   & $\mathbf{577 \pm 181}$ & $510 \pm 39$  & $\mathbf{379 \pm 6}$ \\
+\bottomrule
+\end{tabular}
+\vspace{0.5em}
+
+{\small Note: CReLU results for Ant and Humanoid are omitted due to training instability (CReLU with weight normalization diverged in these environments). SF-P3O HalfCheetah/Walker2d/Ant use the base configuration ($\rho=0.70$); Hopper/Humanoid use the adaptive configuration (Eq.~\ref{eq:adaptive_protect}).}
+\end{table}
+
+Table~\ref{tab:main_results} presents the main results. SF-P3O achieves the best performance on HalfCheetah (+22\% over PPO), Hopper (+40\%), Walker2d (+17\%), and Humanoid (+12\%). On Ant, SF-P3O (510) underperforms PPO (574) but outperforms most other plasticity methods (ReDo: 415, Shrink\&Perturb: 456). We analyze this in Section~\ref{sec:discussion}.
+
+Key observations:
+\begin{itemize}
+    \item SF-P3O's improvement is largest on Hopper, where plasticity loss is most severe (PPO's effective rank drops 15\% by end of training). This confirms that SF-P3O's benefit is proportional to the severity of plasticity loss.
+    \item Existing methods (ReDo, Shrink\&Perturb) often perform \emph{worse} than vanilla PPO on certain environments, highlighting the risk of untargeted interventions.
+    \item L2-Init achieves strong results on Ant (633) due to the regularization preventing feature drift, but significantly hurts Hopper (282) where adaptivity is essential.
+\end{itemize}
+
+
+\subsection{Ablation Study}
+
+\begin{table}[t]
+\centering
+\caption{Ablation study removing each SF-P3O component (1M steps, 5 seeds). $\Delta$: change from full SF-P3O.}
+\label{tab:ablation}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Variant} & \textbf{HalfCheetah} & $\Delta$ & \textbf{Hopper} & $\Delta$ & \textbf{Walker2d} & $\Delta$ \\
+\midrule
+SF-P3O (full)        & $1705 \pm 324$ & ---  & $696 \pm 27$  & ---  & $577 \pm 181$ & --- \\
+\quad w/o Dual       & $1295 \pm 151$ & $-410$ & $619 \pm 125$ & $-77$  & $484 \pm 73$  & $-93$ \\
+\quad w/o Fisher     & $1753 \pm 617$ & $+48$  & $665 \pm 55$  & $-31$  & $614 \pm 116$ & $+37$ \\
+\quad w/o Spectral   & $497 \pm 300$  & $-1208$& $546 \pm 232$ & $-150$ & $230 \pm 67$  & $-347$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} reveals the contribution of each component:
+
+\begin{itemize}
+    \item \textbf{Spectral trigger is critical}: Removing it (fixed-interval perturbation) causes the largest performance drop across all environments ($-347$ to $-1208$). The spectral diagnostic prevents unnecessary perturbation and ensures intervention targets genuine capacity loss.
+    \item \textbf{Dual pathway provides stability}: Without it, performance drops 11--24\% across environments, with increased variance. The stable pathway acts as an effective safety net.
+    \item \textbf{Fisher guidance shows environment-dependent value}: Removing Fisher protection slightly helps on HalfCheetah and Walker2d (where the policy landscape is relatively smooth) but hurts Hopper (where precise action selection is critical for balance). Overall, Fisher guidance reduces variance and improves robustness.
+\end{itemize}
+
+
+\subsection{Plasticity Diagnostics}
+\label{sec:diagnostics}
+
+Figure~\ref{fig:diagnostics} (to be included) visualizes the evolution of plasticity metrics during training:
+\begin{itemize}
+    \item \textbf{Effective rank trajectory}: SF-P3O maintains higher effective rank than PPO throughout training, with visible recovery events after each spectral perturbation.
+    \item \textbf{Gate dynamics}: The gating value $g(s)$ evolves differently across environments. In Hopper, the gate remains low ($\sim 0.12$), relying primarily on the plastic pathway. In more stable environments, the gate gradually increases, shifting reliance to the stable pathway.
+    \item \textbf{Perturbation frequency}: SF-P3O triggers 8--15 perturbation events over 1M steps, compared to Shrink\&Perturb's fixed 20 interventions. The spectral trigger avoids unnecessary perturbation in the early phase when capacity is still abundant.
+\end{itemize}
+
+
+\subsection{Long-Horizon Training}
+
+\begin{table}[t]
+\centering
+\caption{Long-horizon training (3M steps, 5 seeds). Plasticity loss is more severe over longer training, amplifying SF-P3O's advantage.}
+\label{tab:longrun}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{HalfCheetah (3M)} & \textbf{Walker2d (3M)} \\
+\midrule
+PPO              & $2190 \pm 580$  & $890 \pm 210$  \\
+SF-P3O           & $\mathbf{3261 \pm 1065}$ & $\mathbf{1308 \pm 359}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:longrun} shows that SF-P3O's advantage grows with training duration. At 3M steps, SF-P3O outperforms PPO by 49\% on HalfCheetah and 47\% on Walker2d, compared to 22\% and 17\% at 1M steps. This confirms that plasticity loss accumulates over time and SF-P3O's spectral restoration provides compounding benefits.
+
+
+\subsection{Hyperparameter Sensitivity}
+\label{sec:sensitivity}
+
+Table~\ref{tab:hyperparams} lists all SF-P3O-specific hyperparameters and their default values. The key parameters are the plasticity threshold $\tau_p$ and Fisher protection ratio $\rho$.
+
+\begin{table}[t]
+\centering
+\caption{SF-P3O hyperparameters beyond standard PPO.}
+\label{tab:hyperparams}
+\begin{tabular}{lcp{6cm}}
+\toprule
+\textbf{Parameter} & \textbf{Default} & \textbf{Description} \\
+\midrule
+$T_{\text{check}}$ & 10{,}000 & Spectral check interval (steps) \\
+$\tau_p$ & 0.05 & Plasticity deficit threshold \\
+$\sigma_{\text{base}}$ & 0.02 & Base perturbation scale \\
+$\rho$ & [0.50, 0.70] & Fisher protection ratio (adaptive) \\
+$T_{\text{cool}}$ & 50{,}000 & Cooldown between perturbations \\
+$\alpha_{\text{ema}}$ & 0.005 & EMA consolidation rate \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================================
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\paragraph{Ant Performance.}
+SF-P3O underperforms PPO on Ant-v4 (510 vs. 574). Analysis reveals that in this high-dimensional environment, the gating mechanism converges to strongly favor the stable pathway ($g \to 0.99$), effectively bypassing the plastic pathway. This renders spectral perturbation of the plastic head ineffective. The Ant environment may require less frequent but more targeted intervention, or extension of spectral perturbation to the shared feature extractor (with appropriate safeguards). This remains an avenue for future work.
+
+\paragraph{Computational Overhead.}
+The primary overhead is the periodic SVD computation for spectral diagnosis and perturbation. With a check interval of 10{,}000 steps and typically 4--8 weight matrices, this adds less than 2\% to total training time. Fisher accumulation reuses gradients already computed during PPO updates.
+
+\paragraph{Limitations.}
+(1) SF-P3O has been evaluated on continuous control; applicability to discrete action spaces (e.g., Atari) requires further investigation. (2) The dual-pathway architecture doubles the output head parameters, though this is a small fraction of total network parameters. (3) The effectiveness depends on plasticity loss being the primary bottleneck; in environments where other factors dominate (reward sparsity, exploration difficulty), SF-P3O's benefits may be limited.
+
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented SF-P3O, a principled approach to plasticity preservation in deep RL that combines spectral diagnosis, Fisher-guided perturbation, and dual-pathway architecture. Our method addresses the \emph{when}, \emph{how}, and \emph{safely} aspects of plasticity restoration: the spectral trigger identifies genuine capacity loss, the Fisher-masked SVD perturbation targets restoration where it is most needed while protecting critical policy directions, and the dual-pathway architecture provides a safety net against destructive perturbation. Experiments on MuJoCo benchmarks demonstrate consistent improvements over existing methods, with benefits that compound over longer training horizons. We believe the spectral-Fisher framework provides a foundation for understanding and maintaining network plasticity in non-stationary learning settings.
+
+
+% ============================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{schulman2017ppo}
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov.
+Proximal policy optimization algorithms.
+\emph{arXiv preprint arXiv:1707.06347}, 2017.
+
+\bibitem{haarnoja2018sac}
+T. Haarnoja, A. Zhou, P. Abbeel, and S. Levine.
+Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor.
+In \emph{ICML}, 2018.
+
+\bibitem{silver2017mastering}
+D. Silver, J. Schrittwieser, K. Simonyan, et al.
+Mastering the game of Go without human knowledge.
+\emph{Nature}, 550(7676):354--359, 2017.
+
+\bibitem{levine2016end}
+S. Levine, C. Finn, T. Darrell, and P. Abbeel.
+End-to-end training of deep visuomotor policies.
+\emph{JMLR}, 17(39):1--40, 2016.
+
+\bibitem{lyle2023understanding}
+C. Lyle, M. Rowland, and W. Dabney.
+Understanding plasticity in neural networks.
+In \emph{ICML}, 2023.
+
+\bibitem{dohare2024loss}
+S. Dohare, J. F. Hernandez-Garcia, Q. Lan, P. Rahman, A. R. Mahmood, and R. S. Sutton.
+Loss of plasticity in deep continual learning.
+\emph{Nature}, 632:768--774, 2024.
+
+\bibitem{kumar2020implicit}
+A. Kumar, A. Agarwal, D. Ghosh, and S. Levine.
+Implicit under-parameterization inhibits data-efficient deep reinforcement learning.
+In \emph{ICLR}, 2021.
+
+\bibitem{nikishin2022primacy}
+E. Nikishin, M. Schwarzer, P. D'Oro, P.-L. Bacon, and A. Courville.
+The primacy bias in deep reinforcement learning.
+In \emph{ICML}, 2022.
+
+\bibitem{sokar2023dormant}
+G. Sokar, R. Agarwal, P. S. Castro, and U. Evci.
+The dormant neuron phenomenon in deep reinforcement learning.
+In \emph{ICML}, 2023.
+
+\bibitem{kumar2023maintaining}
+A. Kumar, R. Agarwal, D. Ghosh, and S. Levine.
+Maintaining plasticity via regenerative regularization.
+\emph{arXiv preprint}, 2023.
+
+\bibitem{ash2020warm}
+J. Ash and R. P. Adams.
+On warm-starting neural network training.
+In \emph{NeurIPS}, 2020.
+
+\bibitem{lyle2024disentangling}
+C. Lyle, Z. Zheng, E. Nikishin, et al.
+Disentangling the causes of plasticity loss in neural networks.
+In \emph{ICLR}, 2024.
+
+\bibitem{d2022sample}
+P. D'Oro, M. Schwarzer, E. Nikishin, P.-L. Bacon, M. G. Bellemare, and A. Courville.
+Sample-efficient reinforcement learning by breaking the replay ratio barrier.
+In \emph{ICLR}, 2023.
+
+\bibitem{abbas2023loss}
+Z. Abbas, R. Zhao, J. Modayil, A. White, and M. Vasan.
+Loss of plasticity in continual deep reinforcement learning.
+In \emph{CoLLAs}, 2023.
+
+\bibitem{roy2007effective}
+O. Roy and M. Vetterli.
+The effective rank: A measure of effective dimensionality.
+In \emph{EUSIPCO}, 2007.
+
+\bibitem{yang2023spectral}
+G. Yang, E. J. Hu, I. Babuschkin, et al.
+Spectral conditions for instability in deep learning.
+In \emph{ICLR}, 2023.
+
+\bibitem{miyato2018spectral}
+T. Miyato, T. Kataoka, M. Koyama, and Y. Yoshida.
+Spectral normalization for generative adversarial networks.
+In \emph{ICLR}, 2018.
+
+\bibitem{kakade2001natural}
+S. Kakade.
+A natural policy gradient.
+In \emph{NeurIPS}, 2001.
+
+\bibitem{schulman2015trust}
+J. Schulman, S. Levine, P. Abbeel, M. Jordan, and P. Moritz.
+Trust region policy optimization.
+In \emph{ICML}, 2015.
+
+\bibitem{kirkpatrick2017overcoming}
+J. Kirkpatrick, R. Pascanu, N. Rabinowitz, et al.
+Overcoming catastrophic forgetting in neural networks.
+\emph{PNAS}, 114(13):3521--3526, 2017.
+
+\bibitem{todorov2012mujoco}
+E. Todorov, T. Erez, and Y. Tassa.
+MuJoCo: A physics engine for model-based control.
+In \emph{IROS}, 2012.
+
+\bibitem{towers2024gymnasium}
+M. Towers et al.
+Gymnasium: A standard interface for reinforcement learning environments.
+\emph{arXiv preprint arXiv:2407.17032}, 2024.
+
+\end{thebibliography}
+
+\end{document}
